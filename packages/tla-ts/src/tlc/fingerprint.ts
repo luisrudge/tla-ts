@@ -137,16 +137,24 @@ const createShiftTable = (length: number) => {
   return table;
 };
 
+// A shift table depends only on its length, so every fingerprinter shares them.
+const shiftTables = new Map<number, Int32Array>();
+
+// The values a fingerprinter caches before it starts over, which bounds the values it keeps alive.
+const MAX_CACHED_VALUES = 1 << 22;
+
 // Extending a fingerprint by a byte is linear over GF(2), so extending it by a value's bytes
 // XORs the value's own fingerprint from zero into the fingerprint shifted by their length.
-// The fingerprinter caches each distinct function or set it meets, nested ones included, for one
-// pass over the stored states, as states share most of their values. It reads a state's variables
+// The fingerprinter caches each distinct function or set it meets, nested ones included, across
+// the states it fingerprints, as states share most of their values. It reads a state's variables
 // in `order` and writes each fingerprint's low and high words into `words`, an Int32Array over a
 // little-endian BigInt64Array.
 export const createTlcFingerprinter = (order: number[], words: Int32Array) => {
-  const shiftTables = new Map<number, Int32Array>();
   const indices = new Map<Value, number>();
+  // Each cached value's byte count and fingerprint from zero, three numbers per value, and the
+  // shift table for its byte count.
   const contributions: number[] = [];
+  const tables: Int32Array[] = [];
   const getShiftTable = (length: number) => {
     const cached = shiftTables.get(length);
     if (cached) return cached;
@@ -156,17 +164,28 @@ export const createTlcFingerprinter = (order: number[], words: Int32Array) => {
   };
   // Extends the fingerprint by a value's bytes and returns how many there are.
   const extendElement = (value: Value): number => {
+    if (typeof value === "boolean") {
+      extendByte(BOOL_VALUE);
+      extendByte(value ? 116 : 102);
+      return 2;
+    }
+    if (typeof value === "number") {
+      extendByte(INT_VALUE);
+      extendInt(value);
+      return 5;
+    }
     if (typeof value !== "object" || isModelValue(value)) {
       extendValue(value);
       return getFingerprintLength(value);
     }
     const contribution = getContribution(value);
-    const shifted = { high, low };
-    const table = getShiftTable(contributions[contribution]);
+    const table = tables[contribution / 3];
+    const shiftedHigh = high;
+    const shiftedLow = low;
     high = contributions[contribution + 1];
     low = contributions[contribution + 2];
     for (let position = 0; position < 8; position++) {
-      const word = position < 4 ? shifted.low : shifted.high;
+      const word = position < 4 ? shiftedLow : shiftedHigh;
       const entry = (position * 256 + ((word >>> ((position & 3) * 8)) & 0xff)) * 2;
       high ^= table[entry];
       low ^= table[entry + 1];
@@ -176,7 +195,8 @@ export const createTlcFingerprinter = (order: number[], words: Int32Array) => {
   const getContribution = (value: Value) => {
     const cached = indices.get(value);
     if (cached !== undefined) return cached;
-    const outer = { high, low };
+    const outerHigh = high;
+    const outerLow = low;
     high = 0;
     low = 0;
     const length = { value: 5 };
@@ -197,18 +217,25 @@ export const createTlcFingerprinter = (order: number[], words: Int32Array) => {
     const contribution = contributions.length;
     indices.set(value, contribution);
     contributions.push(length.value, high, low);
-    high = outer.high;
-    low = outer.low;
+    tables.push(getShiftTable(length.value));
+    high = outerHigh;
+    low = outerLow;
     return contribution;
   };
   return (state: Value[], position: number) => {
-    const outer = { high, low };
+    if (indices.size > MAX_CACHED_VALUES) {
+      indices.clear();
+      contributions.length = 0;
+      tables.length = 0;
+    }
+    const outerHigh = high;
+    const outerLow = low;
     high = INITIAL_HIGH;
     low = INITIAL_LOW;
     for (const index of order) extendElement(state[index]);
     words[2 * position] = low;
     words[2 * position + 1] = high;
-    high = outer.high;
-    low = outer.low;
+    high = outerHigh;
+    low = outerLow;
   };
 };
