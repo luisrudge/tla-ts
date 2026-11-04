@@ -1,6 +1,7 @@
 // Worker threads as Web Workers, or as Node's worker_threads where there are none.
 
 const WORKER_THREADS_MODULE = "node:worker_threads";
+const BUN_JSC_MODULE = "bun:jsc";
 
 export interface Port {
   postMessage: (message: unknown, transfer?: unknown[]) => void;
@@ -59,4 +60,24 @@ export const getParentPort = async () => {
     /* @vite-ignore */ /* webpackIgnore: true */ WORKER_THREADS_MODULE
   );
   return threads.parentPort as unknown as Port;
+};
+
+// A break for a worker that has run a while: on Bun an eden collection, then a turn of the event
+// loop, where JavaScriptCore's timers give back what the collection freed. A worker that never
+// leaves its loop keeps every block it allocated, and ten of them outgrow the machine's memory.
+export const createBreak = async (): Promise<() => Promise<void>> => {
+  const collect =
+    "Bun" in globalThis
+      ? (
+          (await import(/* @vite-ignore */ /* webpackIgnore: true */ BUN_JSC_MODULE)) as {
+            edenGC: () => void;
+          }
+        ).edenGC
+      : undefined;
+  return () => {
+    collect?.();
+    return new Promise((resolve) =>
+      typeof setImmediate === "function" ? setImmediate(resolve) : setTimeout(resolve, 0),
+    );
+  };
 };

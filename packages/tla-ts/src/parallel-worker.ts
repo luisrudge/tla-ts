@@ -18,9 +18,11 @@ import {
   setValueVersion,
   type Value,
 } from "./values";
-import { getParentPort, type Port } from "./worker";
+import { createBreak, getParentPort, type Port } from "./worker";
 
 const LOCKED = -1;
+// How long a worker expands states between breaks.
+const BREAK_INTERVAL_MS = 100;
 
 interface Expansion {
   states: Value[][];
@@ -35,7 +37,7 @@ interface Expansion {
   fingerprintStates: Value[][];
 }
 
-const runWorker = (start: StartMessage, parent: Port) => {
+const runWorker = (start: StartMessage, parent: Port, takeBreak: () => Promise<void>) => {
   const modules = new Map(start.modules);
   const loadModule = (name: string) => modules.get(name);
   const classes = new Map(start.classes);
@@ -106,11 +108,14 @@ const runWorker = (start: StartMessage, parent: Port) => {
     Atomics.store(requests, workerIndex, 0);
   };
 
+  const clock = { expanded: 0, breakAt: performance.now() + BREAK_INTERVAL_MS };
+
   // The worker pauses before a successor when the shared table needs to grow, and resumes there.
   const expand = (expansion: Expansion) => {
     for (; expansion.origin < expansion.end; expansion.origin++) {
       const state = expansion.states[expansion.origin];
       if (!expansion.successors) {
+        if ((++clock.expanded & 0xff) === 0 && performance.now() >= clock.breakAt) return "break";
         if (Atomics.load(requests, workerIndex) > 0) answerRequest(expansion, 0);
         Atomics.store(remaining, workerIndex, expansion.end - expansion.origin - 1);
         expansion.successors = getSuccessors(nextAction, state, environment, search.spec.scope);
@@ -198,6 +203,11 @@ const runWorker = (start: StartMessage, parent: Port) => {
     for (;;) {
       const status = expand(expansion);
       if (status === undefined) return undefined;
+      if (status === "break") {
+        await takeBreak();
+        clock.breakAt = performance.now() + BREAK_INTERVAL_MS;
+        continue;
+      }
       lockRequests(expansion);
       if (status === "paused") {
         const resumed = new Promise<void>((resolve) => (waiters.resume = resolve));
@@ -239,12 +249,15 @@ const runWorker = (start: StartMessage, parent: Port) => {
 };
 
 void getParentPort().then((parent) => {
-  const onStart = (event: { data: unknown }) => {
+  // Created before the start message arrives, and awaited only once it has, so that no message
+  // comes in before the listener.
+  const breakReady = createBreak();
+  const onStart = async (event: { data: unknown }) => {
     const message = event.data as StartMessage;
     if (message.type !== "start") return;
     parent.removeEventListener?.("message", onStart);
     try {
-      runWorker(message, parent);
+      runWorker(message, parent, await breakReady);
     } catch {
       parent.postMessage({ type: "abort" } satisfies WorkerMessage);
     }
